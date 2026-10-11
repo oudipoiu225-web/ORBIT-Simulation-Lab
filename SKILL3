@@ -1,0 +1,154 @@
+---
+name: flutter-app-release-pipeline
+description: Use when releasing or ingesting zips for the Hoda app.
+version: 1.0.0
+author: Nous Research
+license: MIT
+metadata:
+  hermes:
+    tags: [flutter, android, github-actions, release, sqlite]
+    category: software-development
+    related_skills: [docx, github-repo-management, github-pr-workflow]
+---
+
+# Flutter App Release Pipeline
+
+## When to Use
+
+- A user sends an update zip (code/content) for a Flutter app whose APK is
+  auto-built and auto-released by GitHub Actions on push to main.
+- A new release must be published, renamed, cleaned up, or its APK verified
+  (versionCode / signature).
+- The app bundles SQLite content and shipped fixes are not appearing on devices.
+- A store (Cafe Bazaar) reports a wrong version number for the APK.
+- CI must be held back (no builds until the user orders one) or triggered manually.
+
+Class workflow for a Flutter Android app whose APK is built and released automatically
+by a GitHub Actions workflow on every push to main, while a human collaborator (or AI
+tool) sends update zips back for you to merge and publish.
+
+## User's standing rules (Hoda project — apply verbatim)
+
+These were stated by the user, twice with visible frustration. They govern EVERY task
+in this pipeline and must not be re-derived or asked about:
+
+1. **No builds/releases without an explicit user order.** After any non-release push
+   (docs, DB prep, code tweaks), immediately CANCEL the auto-triggered run and DISABLE
+   the Build workflow via API (see §6). Re-enable it only when the user orders a release.
+2. **The user supplies all content sources** (Telegram DOCX/PDF). Never web-search for
+   Quran verses, hadiths, or religious content. If research is needed for framing only,
+   stop and let the user provide the source instead.
+3. **Act autonomously — do not ask clarifying questions** once a task is delegated.
+   Ask only when something is impossible to proceed without. Report results in Persian.
+4. **From user documents, use ONLY the tables.** Ignore surrounding essays, marketing
+   prose, and sources lists — unless a prose section carries structural metadata (e.g.
+   per-section narrator attribution for hadith rows), which may be used for a DB column.
+
+## 1. Ingesting an update zip
+
+- Extract to `/tmp/<name>` (never merge in place), then `diff -rq` against the repo
+  clone excluding `.git`, `build`, `.dart_tool` to see the real change set.
+- Read the diff of every changed file before copying anything.
+- **Collaborator zips often carry STALE android/ configs** (their working copy predates
+  your repo-side fixes). Never copy their `build.gradle`/`proguard-rules.pro` wholesale;
+  copy only their `lib/`+`test/` changes, then re-apply repo-side overlays on top:
+  stable signing block, `-dontwarn` rules that fixed past CI failures.
+- Structural review before merge: run the balance checker from this skill
+  (`python3 <skill_dir>/scripts/dart_balance_check.py FILE [FILE...]`) on every
+  changed `.dart` file — it is comment/string-aware and catches syntax breakage
+  that eyeballing misses. Verify bundled DB md5 unchanged when
+  the update should not touch data, and that `minSdk`, notification deps, and manifest
+  receivers survived.
+- Bump `pubspec.yaml` version, commit with a descriptive message, push.
+
+## 2. Content ingestion into the bundled SQLite DB
+
+- Read user DOCX tables with the `docx` skill (`docx_read.py --structure` first, then
+  `python-docx` per-table). Validate row numbering is contiguous 1..N before parsing.
+- Dedupe against existing rows by NORMALIZED text: strip Arabic harakat
+  (`\u064B-\u0652\u0670\u0640`), unify `أإآٱ→ا`, `ي→ی`, `ك→ک`, collapse whitespace.
+- Schema changes must be ADDITIVE only: `ALTER TABLE ... ADD COLUMN <col> TEXT` with
+  nullable columns, so the running app version keeps working. Never rename or drop
+  columns the app reads.
+- Citation/footnote artifacts the user flags (e.g. trailing reference digits glued to
+  prose) are cleaned with anchored regex — but PRESERVE digits that are real content
+  (unit numbers, ages): check context before each deletion pattern goes wide.
+- A parsed per-table JSON intermediate (`/tmp/*.json`) makes the insert step reviewable
+  and re-runnable after a failed verify.
+
+## 3. Bundled DB upgrades — the silent-staleness pitfall
+
+The app copies `assets/hoda.db` to device storage **only when missing**. After an app
+update, devices keep running the OLD copy: content fixes and new columns are invisible
+no matter what you ship. The fix is a content stamp:
+
+- `DatabaseHelper.dbContentVersion` (checked in `_reCopyIfStale` against a
+  SharedPreferences key) — when the stored stamp is older, re-copy the bundled DB.
+- **Bump the stamp on EVERY change to the bundled DB that a user should see** — new
+  content batches, schema additions, data cleanups. Forgetting this shipped broken
+  data to the user once (citation numbers still visible + narrator column empty) and
+  the user had to report it. The stamp and the data change must go in the SAME commit.
+  Exception: if the bad DB never shipped anywhere (fix still unreleased, user
+  re-downloads the file himself), keep the stamp unchanged on his order — bumping is
+  churn until a build carrying the fix is actually ordered.
+
+## 4. versionCode scheme (user-chosen) and store submission
+
+- Flutter maps pubspec `version: X.Y.Z+N` → `versionName=X.Y.Z`, `versionCode=N`.
+  App stores (Cafe Bazaar) sort updates by **versionCode**, not versionName — a small
+  build number reads as a small version.
+- `android/app/build.gradle` `defaultConfig` OVERRIDES the code by digit concatenation
+  of the version name: `0.1.2→012`, `0.1.3→013`, `0.1.10→0110`, `1.0.0→100`.
+  This was the user's explicit choice ("102 is not logical, make it 012").
+- KNOWN COLLISION ahead: `0.10.0` and `1.0.0` both concatenate to 100. Before the app
+  reaches either version, re-negotiate the scheme with the user.
+- Verify the shipped artifact, not the repo: download the release APK and parse
+  `AndroidManifest.xml` with androguard (`pip install androguard==3.3.5`,
+  `AXMLPrinter` → regex `versionCode="(\d+)"`). Guessing from gradle files has already
+  been wrong once mid-session.
+
+## 5. Release management via GitHub API
+
+- The workflow tags releases `vX.Y.Z+N`. **Changing N in pubspec creates a SECOND
+  release with the same title** — after every re-release, list releases and DELETE the
+  superseded tag's release (keep exactly one per version title).
+- Rename release titles to the plain version (`0.1.2`): `PATCH /releases/{id}`.
+- Rename assets to the versioned name (`hoda-vX.Y.Z.apk`): `PATCH /releases/assets/{id}`
+  — old `app-release.apk` names confuse users comparing downloads.
+- Verify APK signature matches the stable keystore: unzip `META-INF/CERT.RSA` →
+  `keytool -printcert -file ...` → Owner must be the app's CN.
+- Always finish a release by pasting the direct download URL of the current asset.
+
+## 6. CI control (works alongside rule 1)
+
+```
+cancel a run:        POST /repos/{o}/{r}/actions/runs/{id}/cancel
+disable workflow:    PUT  /repos/{o}/{r}/actions/workflows/{id}/disable
+enable workflow:     PUT  /repos/{o}/{r}/actions/workflows/{id}/enable
+manual dispatch:     POST /repos/{o}/{r}/actions/workflows/{id}/dispatches {"ref":"main"}
+```
+
+Watch runs by polling `GET /actions/runs/{id}` on a ~35s loop (bounded, ≤14 iterations
+per call — GitHub Flutter builds take 4–8 min).
+
+## 7. Stable signing (in-place updates)
+
+- Keystore generated once with `keytool -genkeypair -validity 36500` (100 years).
+- Stored as repo secrets: base64 of the .jks + its password. Uploading needs the repo
+  actions public key sealed with PyNaCl (`pip install pynacl`): `GET
+  /repos/{o}/{r}/actions/secrets/public-key` → `SealedBox(PublicKey(...)).encrypt(value)`
+  → `PUT /actions/secrets/{NAME}`.
+- `build.gradle` reads `android/key.properties` (gitignored) for `signingConfig`;
+  the workflow decodes the keystore from secrets at build time. Same signature across
+  releases = Android installs updates in-place, no uninstall.
+- Keep a local backup of the .jks + password; they are unrecoverable if lost.
+
+## Flutter API gotchas (each cost a CI run once)
+
+- `TextButton.icon` has **no `tooltip` parameter** (that's `IconButton`). A label
+  carrying the same text is the correct substitute.
+- R8 strips Gson generic signatures → `flutter_local_notifications` throws
+  "Missing type parameter" on release builds only. The proguard file must keep the
+  Gson/TypeToken rules; keep them when merging collaborator proguard files.
+- R8 aborts on `com.google.android.play.core.**` classes not on the classpath —
+  `-dontwarn com.google.android.play.core.**` must stay in proguard-rules.pro.

@@ -1,0 +1,48 @@
+name: Android
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Unit tests and debug APK
+        run: gradle --no-daemon :app:testDebugUnitTest :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbit-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Restore release signing key
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          KEYSTORE_B64: ${{ secrets.ORBIT_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.ORBIT_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ORBIT_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ORBIT_KEY_ALIAS }}
+        run: |
+          test -n "$KEYSTORE_B64" && test -n "$STORE_PASSWORD" && test -n "$KEY_PASSWORD" && test -n "$KEY_ALIAS"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > orbit-upload.jks
+          printf 'storeFile=orbit-upload.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
+      - name: Signed release APK
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: gradle --no-daemon :app:assembleRelease
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" app/build/outputs/apk/release/app-release.apk --title "${GITHUB_REF_NAME}" --generate-notes --verify-tag
